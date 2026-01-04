@@ -18,16 +18,69 @@ const COMMAND_TIMEOUT = 10000; // 10 seconds
 const SUPPORTED_IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif'];
 
 // Windows reserved filenames that cannot be used
-const WINDOWS_RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i;
+const WINDOWS_RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|
+$)/i;
 
 // ==================== HELPER FUNCTIONS ====================
 
 /**
+ * Checks if a path is a WSL UNC path (\\wsl$\ or \\wsl.localhost\)
+ * @param {string} fsPath - The path to check
+ * @returns {boolean} True if it's a WSL UNC path
+ */
+function isWslUncPath(fsPath) {
+    if (!fsPath) return false;
+    return /^\\\\(?:wsl\$|wsl\.localhost)\\/i.test(fsPath);
+}
+
+/**
+ * Extracts the WSL distro name from a UNC path
+ * @param {string} uncPath - WSL UNC path (e.g., "\\wsl$\Ubuntu\home\...")
+ * @returns {string|null} Distro name or null if not a valid UNC path
+ */
+function getWslDistroFromUncPath(uncPath) {
+    const match = uncPath.match(/^\\\\(?:wsl\$|wsl\.localhost)\\([^\\]+)/i);
+    return match ? match[1] : null;
+}
+
+/**
+ * Converts a WSL UNC path to native WSL path format
+ * @param {string} uncPath - WSL UNC path (e.g., "\\wsl$\Ubuntu\home\user\project")
+ * @returns {string} Native WSL path (e.g., "/home/user/project")
+ */
+function uncPathToWslPath(uncPath) {
+    // Match \\wsl$\DistroName\rest\of\path or \\wsl.localhost\DistroName\rest\of\path
+    const match = uncPath.match(/^\\\\(?:wsl\$|wsl\.localhost)\\[^\\]+(.*)/i);
+    if (match) {
+        // Convert backslashes to forward slashes
+        return match[1].replace(/\\/g, '/') || '/';
+    }
+    return uncPath;
+}
+
+/**
+ * Converts a native WSL path to Windows UNC path format
+ * @param {string} wslPath - Native WSL path (e.g., "/home/user/project")
+ * @param {string} distro - WSL distro name (e.g., "Ubuntu")
+ * @returns {string} Windows UNC path (e.g., "\\wsl$\Ubuntu\home\user\project")
+ */
+function wslPathToUncPath(wslPath, distro) {
+    return `\\\\wsl$\\${distro}${wslPath.replace(/\//g, '\\')}`;
+}
+
+/**
  * Converts a Windows path to WSL path format for Node.js file operations
- * @param {string} winPath - Windows path (e.g., "C:\Users\...")
- * @returns {string} WSL path (e.g., "/mnt/c/Users/...")
+ * Handles both standard Windows paths (C:\...) and WSL UNC paths (\\wsl$\...)
+ * @param {string} winPath - Windows path (e.g., "C:\Users\..." or "\\wsl$\Ubuntu\home\...")
+ * @returns {string} WSL path (e.g., "/mnt/c/Users/..." or "/home/...")
  */
 function windowsToWslPath(winPath) {
+    // Handle WSL UNC paths first
+    if (isWslUncPath(winPath)) {
+        return uncPathToWslPath(winPath);
+    }
+    
+    // Handle standard Windows paths (C:\...)
     return winPath
         .replace(/\\/g, '/')
         .replace(/^([A-Z]):/, (match, drive) => `/mnt/${drive.toLowerCase()}`);
@@ -176,14 +229,13 @@ function cleanupOldImages(directory, maxImages) {
             for (const file of filesToDelete) {
                 try {
                     fs.unlinkSync(file.path);
-                    console.log(`Cleaned up old image: ${file.name}`);
                 } catch (error) {
-                    console.log(`Failed to delete ${file.name}: ${error.message}`);
+                    // Ignore deletion errors
                 }
             }
         }
     } catch (error) {
-        console.log('Could not cleanup old images:', error.message);
+        // Ignore cleanup errors
     }
 }
 
@@ -191,12 +243,14 @@ function cleanupOldImages(directory, maxImages) {
  * Handles moving the image to a custom save directory if configured
  * @param {string} tempImagePath - Path to the temporary image file (WSL format in WSL, Windows format on Windows)
  * @param {string} platform - Current platform: 'windows' or 'wsl'
- * @returns {Promise<string>} - Final path where the image was saved
+ * @returns {Promise<string>} - Final path where the image was saved, and additional context
  */
 async function handleCustomSaveDirectory(tempImagePath, platform) {
     const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
     const customDirectory = config.get('saveDirectory');
     let finalPath = tempImagePath;
+    let wslDistro = null;  // Track WSL distro for UNC path handling
+    let isWslWorkspace = false;  // Track if workspace is in WSL
 
     // If custom directory is set, move the file there
     if (customDirectory && customDirectory.trim() !== '') {
@@ -208,31 +262,70 @@ async function handleCustomSaveDirectory(tempImagePath, platform) {
             throw new Error(validationError);
         }
 
-        let expandedDir = customDirectory.replace(/^~/, os.homedir());
+        // Check if workspace is in WSL (accessed via UNC path from Windows)
+        if (workspaceFolder) {
+            const workspaceFsPath = workspaceFolder.uri.fsPath;
+            isWslWorkspace = isWslUncPath(workspaceFsPath);
+            if (isWslWorkspace) {
+                wslDistro = getWslDistroFromUncPath(workspaceFsPath);
+            }
+        }
+
+        let expandedDir = customDirectory;
+        
+        // Handle ~ (home directory) expansion
+        if (customDirectory.startsWith('~')) {
+            if (isWslWorkspace && wslDistro) {
+                // When workspace is in WSL, ~ should expand to WSL home, not Windows home
+                try {
+                    const { stdout } = await execPromise(`wsl.exe -d ${wslDistro} -- echo $HOME`, { timeout: 5000 });
+                    const wslHome = stdout.trim();
+                    expandedDir = customDirectory.replace(/^~/, wslHome);
+                } catch (error) {
+                    // Fallback: try to extract from workspace path
+                    const workspaceWslPath = uncPathToWslPath(workspaceFolder.uri.fsPath);
+                    const homeMatch = workspaceWslPath.match(/^(\/home\/[^\/]+)/);
+                    if (homeMatch) {
+                        expandedDir = customDirectory.replace(/^~/, homeMatch[1]);
+                    } else {
+                        throw new Error('Cannot expand ~ in WSL context. Please use an absolute path.');
+                    }
+                }
+            } else {
+                // Standard expansion using OS home directory
+                expandedDir = customDirectory.replace(/^~/, os.homedir());
+            }
+        }
 
         // If path is relative, make it relative to workspace root
-        if (!path.isAbsolute(expandedDir)) {
+        if (!path.isAbsolute(expandedDir) && !expandedDir.startsWith('/')) {
             if (workspaceFolder) {
                 let workspacePath = workspaceFolder.uri.fsPath;
 
-                // Normalize workspace path to match our working format
-                if (platform === 'wsl' && workspacePath.match(/^[A-Z]:/i)) {
-                    // Workspace path is Windows format but we need WSL format
+                if (isWslWorkspace) {
+                    // Workspace is in WSL, keep using UNC path for Windows fs operations
+                    expandedDir = path.join(workspacePath, expandedDir);
+                } else if (platform === 'wsl' && workspacePath.match(/^[A-Z]:/i)) {
+                    // Native WSL with Windows-style workspace path
                     workspacePath = windowsToWslPath(workspacePath);
-                }
-
-                // Use path.posix for WSL paths, path for Windows
-                if (platform === 'wsl') {
+                    expandedDir = workspacePath + '/' + expandedDir;
+                } else if (platform === 'wsl') {
+                    // Native WSL with WSL-style workspace path
                     expandedDir = workspacePath + '/' + expandedDir;
                 } else {
+                    // Native Windows
                     expandedDir = path.join(workspacePath, expandedDir);
                 }
 
-                // Auto-add to .gitignore
-                ensureGitignore(workspacePath, customDirectory);
+                // Auto-add to .gitignore (use appropriate path format)
+                const gitignoreWorkspacePath = isWslWorkspace ? workspaceFolder.uri.fsPath : workspacePath;
+                ensureGitignore(gitignoreWorkspacePath, customDirectory);
             } else {
                 throw new Error('Relative save directory requires an open workspace folder');
             }
+        } else if (isWslWorkspace && expandedDir.startsWith('/')) {
+            // Absolute WSL path in WSL workspace context - convert to UNC for Windows fs operations
+            expandedDir = wslPathToUncPath(expandedDir, wslDistro);
         }
 
         // Create directory if it doesn't exist
@@ -257,10 +350,12 @@ async function handleCustomSaveDirectory(tempImagePath, platform) {
             fileName = fileName.replace(/^img_/, filenamePrefix);
         }
 
-        // Build final path
-        finalPath = platform === 'wsl'
-            ? expandedDir + '/' + fileName
-            : path.join(expandedDir, fileName);
+        // Build final path (use Windows path operations when in Windows or UNC context)
+        if (platform === 'wsl' && !isWslWorkspace) {
+            finalPath = expandedDir + '/' + fileName;
+        } else {
+            finalPath = path.join(expandedDir, fileName);
+        }
 
         // Final safety check: ensure filename doesn't contain path traversal
         if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
@@ -272,7 +367,7 @@ async function handleCustomSaveDirectory(tempImagePath, platform) {
             fs.copyFileSync(tempImagePath, finalPath);
             fs.unlinkSync(tempImagePath);
         } catch (error) {
-            // Provide user-friendly error messages (sanitized)
+            // Provide user-friendly error messages
             let userMsg = 'Failed to save image';
             if (error.code === 'ENOENT') {
                 userMsg = 'Save directory could not be accessed';
@@ -289,7 +384,8 @@ async function handleCustomSaveDirectory(tempImagePath, platform) {
         cleanupOldImages(expandedDir, maxImages);
     }
 
-    return finalPath;
+    // Return both the final path and context about WSL workspace
+    return { finalPath, isWslWorkspace, wslDistro };
 }
 
 /**
@@ -416,7 +512,7 @@ function activate(context) {
                 return;
             }
 
-            // Debug: Show that the command was triggered
+            // Show processing status
             vscode.window.setStatusBarMessage('$(loading~spin) Claude Image Paste: Processing clipboard...', 5000);
 
             // Step 4: Execute the main image processing workflow
@@ -429,13 +525,15 @@ function activate(context) {
                     return;
                 }
 
-                // Step 4b: Convert to WSL path for fs operations if we're in WSL
+                // Step 4b: Convert to WSL path for fs operations if we're in native WSL
                 if (platform === 'wsl') {
                     imagePath = windowsToWslPath(imagePath);
                 }
 
                 // Step 4c: Move to custom directory if user has configured one
-                imagePath = await handleCustomSaveDirectory(imagePath, platform);
+                const saveResult = await handleCustomSaveDirectory(imagePath, platform);
+                imagePath = saveResult.finalPath;
+                const isWslWorkspace = saveResult.isWslWorkspace;
 
                 // Step 4d: Give user opportunity to rename the file (if not skipped)
                 const skipRenamePrompt = config.get('skipRenamePrompt', false);
@@ -445,7 +543,18 @@ function activate(context) {
                 }
 
                 // Step 4e: Convert path for terminal and insert with @ prefix
-                const terminalPath = (platform === 'wsl') ? imagePath : windowsToWslPath(imagePath);
+                let terminalPath;
+                if (platform === 'wsl') {
+                    // Native WSL - path is already in WSL format
+                    terminalPath = imagePath;
+                } else if (isWslWorkspace) {
+                    // Windows Cursor with WSL workspace - convert UNC path to WSL path
+                    terminalPath = windowsToWslPath(imagePath);
+                } else {
+                    // Native Windows - convert to WSL-style path for Claude
+                    terminalPath = windowsToWslPath(imagePath);
+                }
+                
                 activeTerminal.sendText(`@${terminalPath}`, false);
 
                 // Step 4f: Show success notification with file details
@@ -501,28 +610,48 @@ function getPlatform() {
 
 /**
  * Gets the Windows temp directory path from WSL
+ * Uses C:\Windows\Temp to avoid Unicode issues with user profile paths
  * @returns {Promise<string>} Windows temp directory in WSL path format
  */
 async function getWindowsTempDir() {
+    // Use C:\Windows\Temp to avoid Unicode issues with non-ASCII user names
+    const safeTempPath = '/mnt/c/Windows/Temp';
+    
     try {
-        // Try to get actual Windows temp path
+        if (fs.existsSync(safeTempPath)) {
+            // Test write access
+            const testFile = `${safeTempPath}/.claude_test_${Date.now()}`;
+            fs.writeFileSync(testFile, 'test');
+            fs.unlinkSync(testFile);
+            return safeTempPath;
+        }
+    } catch (error) {
+        // C:\Windows\Temp not writable, trying alternatives
+    }
+    
+    // Fallback: Try C:\Temp
+    const altTempPath = '/mnt/c/Temp';
+    try {
+        if (!fs.existsSync(altTempPath)) {
+            fs.mkdirSync(altTempPath, { recursive: true });
+        }
+        return altTempPath;
+    } catch (error) {
+        // Ignore
+    }
+
+    // Last resort: Use user temp (may have Unicode issues)
+    try {
         const { stdout } = await execPromise('cmd.exe /c echo %TEMP%', { timeout: 5000 });
         const winTemp = stdout.trim();
         if (winTemp && !winTemp.includes('%')) {
             return windowsToWslPath(winTemp);
         }
     } catch (error) {
-        // Ignore errors, fall through to default
+        // Ignore
     }
 
-    // Fallback: Use user's temp in Windows profile
-    const userProfile = process.env.USERPROFILE || '';
-    if (userProfile) {
-        return windowsToWslPath(userProfile) + '/AppData/Local/Temp';
-    }
-
-    // Last resort fallback
-    return '/mnt/c/Windows/Temp';
+    return safeTempPath;
 }
 
 /**
@@ -534,40 +663,51 @@ async function getWindowsTempDir() {
  */
 async function getImageFromClipboard(platform) {
     // PowerShell script that handles both file drops and bitmap clipboard data
-    const psScript = `
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$files = [System.Windows.Forms.Clipboard]::GetFileDropList()
-if ($files -and $files.Count -gt 0) {
-    $sourceFile = $files[0]
-    if (Test-Path $sourceFile) {
-        $imageExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif')
-        $extension = [System.IO.Path]::GetExtension($sourceFile).ToLower()
-        if ($imageExtensions -contains $extension) {
-            $dateString = Get-Date -Format "yyyyMMdd_HHmmss"
-            $tempPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "img_$dateString$extension")
-            Copy-Item -Path $sourceFile -Destination $tempPath -Force
-            Write-Output $tempPath
-            exit 0
-        }
-    }
-}
-
-$image = [System.Windows.Forms.Clipboard]::GetImage()
-if ($image -ne $null) {
-    $dateString = Get-Date -Format "yyyyMMdd_HHmmss"
-    $tempPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "img_$dateString.png")
-    $image.Save($tempPath, [System.Drawing.Imaging.ImageFormat]::Png)
-    $image.Dispose()
-    Write-Output $tempPath
-    exit 0
-}
-
-Write-Error "No image in clipboard"
-exit 1
-`.trim();
+    // IMPORTANT: Uses C:\Windows\Temp instead of user temp to avoid Unicode path issues
+    const psScript = [
+        '$ErrorActionPreference = "Stop"',
+        'Add-Type -AssemblyName System.Windows.Forms',
+        'Add-Type -AssemblyName System.Drawing',
+        '',
+        '# Use C:\\Windows\\Temp to avoid Unicode issues with user profile paths',
+        '$safeTempPath = "C:\\Windows\\Temp"',
+        'if (-not (Test-Path $safeTempPath)) {',
+        '    $safeTempPath = [System.IO.Path]::GetTempPath()',
+        '}',
+        '',
+        '$files = [System.Windows.Forms.Clipboard]::GetFileDropList()',
+        'if ($files -and $files.Count -gt 0) {',
+        '    $sourceFile = $files[0]',
+        '    if (Test-Path $sourceFile) {',
+        '        $imageExtensions = @(".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif")',
+        '        $extension = [System.IO.Path]::GetExtension($sourceFile).ToLower()',
+        '        if ($imageExtensions -contains $extension) {',
+        '            $dateString = Get-Date -Format "yyyyMMdd_HHmmss"',
+        '            $randomSuffix = [System.IO.Path]::GetRandomFileName().Substring(0, 8)',
+        '            $fileName = "img_" + $dateString + "_" + $randomSuffix + $extension',
+        '            $tempPath = [System.IO.Path]::Combine($safeTempPath, $fileName)',
+        '            Copy-Item -Path $sourceFile -Destination $tempPath -Force',
+        '            Write-Output $tempPath',
+        '            exit 0',
+        '        }',
+        '    }',
+        '}',
+        '',
+        '$image = [System.Windows.Forms.Clipboard]::GetImage()',
+        'if ($image -ne $null) {',
+        '    $dateString = Get-Date -Format "yyyyMMdd_HHmmss"',
+        '    $randomSuffix = [System.IO.Path]::GetRandomFileName().Substring(0, 8)',
+        '    $fileName = "img_" + $dateString + "_" + $randomSuffix + ".png"',
+        '    $tempPath = [System.IO.Path]::Combine($safeTempPath, $fileName)',
+        '    $image.Save($tempPath, [System.Drawing.Imaging.ImageFormat]::Png)',
+        '    $image.Dispose()',
+        '    Write-Output $tempPath',
+        '    exit 0',
+        '}',
+        '',
+        'Write-Error "No image in clipboard"',
+        'exit 1'
+    ].join('\r\n');
 
     // Generate random filename to prevent race conditions
     const randomSuffix = generateRandomSuffix();
@@ -591,7 +731,7 @@ exit 1
             fs.writeFileSync(scriptPath, psScript, { mode: 0o600 });
         }
 
-        // Convert to Windows path for PowerShell - use array syntax to prevent injection
+        // Convert to Windows path for PowerShell
         const winScriptPath = wslToWindowsPath(scriptPath);
         psExecutable = 'powershell.exe';
         psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', winScriptPath];
@@ -636,7 +776,6 @@ exit 1
             throw new Error('Clipboard access timed out. Please try again.');
         }
 
-        // Provide user-friendly error messages (sanitized - don't expose internal details)
         if (execError.message && execError.message.includes('No image in clipboard')) {
             throw new Error('No image found in clipboard. Copy an image first.');
         }
@@ -652,7 +791,7 @@ exit 1
  * Clean up any resources if needed
  */
 function deactivate() {
-    // Currently no cleanup needed, but this is where we'd add it if required
+    // Currently no cleanup needed
 }
 
 // Export the main functions for VS Code to use

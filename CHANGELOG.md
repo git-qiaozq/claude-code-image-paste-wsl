@@ -2,6 +2,25 @@
 
 All notable changes to the Claude Code Image Paste (WSL) extension will be documented in this file.
 
+## [1.2.0] - 2025-01-04
+
+### Fixed
+- **Critical** Fixed "Save directory could not be accessed" error when using Windows Cursor with WSL projects
+- **Critical** Fixed Unicode path issues for users with non-ASCII (Chinese, etc.) Windows usernames
+- Added support for WSL UNC paths (`\\wsl$\` and `\\wsl.localhost\`)
+- Improved platform detection for Windows Cursor + WSL workspace scenarios
+- `~` (home directory) now correctly expands to WSL home when workspace is in WSL
+- Absolute WSL paths (like `/home/user/images`) now work correctly in Windows Cursor
+
+### Added
+- New helper functions for UNC path handling: `isWslUncPath()`, `uncPathToWslPath()`, `wslPathToUncPath()`
+- Better detection of WSL distro name from workspace path
+
+### Changed
+- PowerShell script now uses `C:\Windows\Temp` instead of user temp directory to avoid Unicode encoding issues
+- `handleCustomSaveDirectory()` now returns additional context about WSL workspace
+- Improved terminal path generation for cross-environment compatibility
+
 ## [1.1.6] - 2025-01-03
 
 ### Changed
